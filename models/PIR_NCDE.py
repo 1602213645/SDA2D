@@ -1,9 +1,6 @@
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torchcde
-from sklearn.metrics import precision_recall_fscore_support, precision_recall_curve, auc, roc_curve
 
 from models.Transformer_Layer import *
 
@@ -57,7 +54,6 @@ class PIR_NCDE(nn.Module):
         self.spatial_head_num = spatial_head_num
         self.if_tanh = if_tanh
         self.if_ts = if_ts
-        self.std_constant = 1e-8
 
         # Define function
         self.initialization = nn.Linear(in_features=self.input_channels, out_features=self.output_channels)
@@ -69,25 +65,14 @@ class PIR_NCDE(nn.Module):
         self.time_extractor = get_torch_trans(heads=self.time_head_num, layers=1, channels=self.window_size)
         self.spatial_extractor = get_torch_trans(heads=self.spatial_head_num, layers=1, channels=self.output_channels)
 
-        # Define reconstruction modules and predictor
-        self.t_recon_mlp = nn.Sequential(
-            nn.Linear(in_features=self.output_channels * 2, out_features=self.output_channels),
-            nn.ReLU(),
-            nn.Linear(in_features=self.output_channels, out_features=self.input_channels))
-        self.d_recon_mlp = nn.Sequential(
-            nn.Linear(in_features=self.input_channels, out_features=2 * self.input_channels),
-            nn.ReLU(),
-            nn.Linear(in_features=2 * self.input_channels, out_features=self.input_channels))
-        self.d_adaptor = nn.Sequential(nn.Linear(in_features=self.output_channels, out_features=self.input_channels),
-                                       nn.ReLU(),
-                                       nn.Linear(in_features=self.input_channels, out_features=self.input_channels))
+        # Classification head
+        self.classifier = nn.Linear(self.output_channels * 2, 3)
 
-    def forward(self, x, coeffs, step):
+    def forward(self, x, coeffs):
         # Get features from defined NCDE
         X = torchcde.CubicSpline(coeffs)
         times = torch.arange(X.interval[-1].item() + 1).to(coeffs.device)
         X0 = X.evaluate(times)
-        dx_dt = X.derivative(times)  # (batch_size, window_size, input_channels), which is used for calculating dz_dt
         z0 = self.initialization(X0)
         z0 = z0.sum(dim=1)
         times = torch.arange(X.interval[-1].item() + 1).to(z0.device)
@@ -118,39 +103,7 @@ class PIR_NCDE(nn.Module):
         features_in_all = torch.concat([features_time_spatial, features_spatial_time],
                                        dim=-1)  # (batch_size, window_size, output_channels * 2)
 
-        # Perform reconstruction on time series
-        recon_time_series = self.t_recon_mlp(features_in_all)
+        pooled_features = features_in_all.mean(dim=1)  # (batch_size, output_channels * 2)
+        logits = self.classifier(pooled_features)  # (batch_size, 3)
 
-        # Calculate pseudo weights
-        reconstruction_loss = F.mse_loss(recon_time_series, x, reduction='none')
-        reconstruction_loss = torch.mean(reconstruction_loss, dim=-1)  # (batch_size, window_size)
-        mean_of_reconstruction_loss = torch.mean(reconstruction_loss, dim=-1, keepdim=True)  # (batch_size, 1)
-        std_of_reconstruction_loss = torch.std(reconstruction_loss, dim=-1, keepdim=True,
-                                               unbiased=False)  # (batch_size, 1)
-        normalized_reconstruction_loss = (reconstruction_loss - mean_of_reconstruction_loss) / (
-                std_of_reconstruction_loss + self.std_constant)  # (batch_size, window_size)
-        if step == 1:
-            step_weight = 0.0
-        else:
-            step_weight = 1 - (1 / np.log(step - 1 + np.e))
-        pseudo_probabilities = torch.sigmoid(normalized_reconstruction_loss * step_weight)
-        mask = torch.bernoulli(1 - pseudo_probabilities)
-        mask = torch.ones(mask.shape).to(x.device)
-
-        # Calculate system derivative for the features extracted from NCDE
-        cur_batch_size = zT.size(0)
-        zT = zT.reshape(-1, self.output_channels)
-        system_derivative = self.function(None, zT)
-        zT = zT.reshape(cur_batch_size, self.window_size, self.output_channels)
-        system_derivative = system_derivative.reshape(cur_batch_size, self.window_size, self.input_channels,
-                                                      self.output_channels)
-        system_derivative = system_derivative.permute(0, 1, 3,
-                                                      2).contiguous()  # (batch_size, window_size, output_channels, input_channels)
-        system_derivative = torch.matmul(system_derivative,
-                                         dx_dt.unsqueeze(-1)).squeeze()  # (batch_size, window_size, output_channels)
-        system_derivative = self.d_adaptor(system_derivative)  # (batch_size, window_size, input_channels)
-
-        # Perform reconstruction on system derivative
-        recon_system_derivative = self.d_recon_mlp(system_derivative)
-
-        return x, recon_time_series, system_derivative, recon_system_derivative, mask, zT
+        return logits
