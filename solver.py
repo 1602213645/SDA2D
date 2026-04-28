@@ -2,23 +2,19 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import TensorDataset, DataLoader
 import torchcde
 import os.path
-from colorama import Fore, Style, init
+from colorama import Fore, init
 from tqdm import tqdm
 import pickle
-from sklearn.metrics import precision_recall_fscore_support, precision_recall_curve, auc, roc_curve
-
-from evaluation.metrics import get_metrics
-
-init(autoreset=True)
+from sklearn.metrics import accuracy_score, f1_score
 
 from models.PIR_NCDE import PIR_NCDE
 from utils.early_stopping import EarlyStoppingTorch
 from utils.slidingWindows import find_length_rank
+
+init(autoreset=True)
 
 
 class Solver(nn.Module):
@@ -53,7 +49,7 @@ class Solver(nn.Module):
         self.validation_size = 0.2
 
         # Define required loss functions
-        self.loss_function = nn.MSELoss(reduction='none')
+        self.loss_function = nn.CrossEntropyLoss()
 
         # Load and prepare data
         self.data_preparation()
@@ -71,26 +67,18 @@ class Solver(nn.Module):
         print(Fore.RED + 'Model define finished.')
 
     def train_model(self):
-        iteration = 0
         for epoch in range(500):
             # Train stage
             self.model.train()
             loop = tqdm(enumerate(self.train_dataloader), total=len(self.train_dataloader), leave=True)
             avg_train_loss = 0.0
-            for index, (data, coeffs) in loop:
+            for index, (data, coeffs, labels) in loop:
                 data = data.to(self.device)
                 coeffs = coeffs.to(self.device)
+                labels = labels.to(self.device)
 
-                iteration += 1
-
-                x, recon_time_series, system_derivative, recon_system_derivative, mask, zT = self.model(data, coeffs,
-                                                                                                        iteration)
-
-                loss_1 = self.loss_function(x, recon_time_series)
-                loss_1 = loss_1.mean(dim=-1) * mask
-                loss_2 = self.loss_function(system_derivative, recon_system_derivative) * self.lambda_derivative_recon
-                loss_2 = loss_2.mean(dim=-1) * mask
-                loss = torch.mean(loss_1 + loss_2)
+                logits = self.model(data, coeffs)
+                loss = self.loss_function(logits, labels)
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -101,7 +89,7 @@ class Solver(nn.Module):
                 loop.set_postfix(loss=loss.item(), avg_loss=avg_train_loss / (index + 1))
 
             # Validation stage
-            validation_loss = self.validation_model(iteration)
+            validation_loss = self.validation_model()
             self.early_stopping(validation_loss, self.model)
             if self.early_stopping.early_stop:
                 print(Fore.RED + 'Training finished. Early stop.')
@@ -115,70 +103,44 @@ class Solver(nn.Module):
             f'{self.save_path}/{self.dataset}/{self.dataset}_{str(self.missing_rate)}_{str(self.seed)}_best_network.pt'))
         self.model.eval()
         loop = tqdm(enumerate(self.test_dataloader), total=len(self.test_dataloader), leave=True)
+        preds_list = []
         labels_list = []
-        time_recon_errors = []
-        system_recon_errors = []
         with torch.no_grad():
             for index, (data, coeffs, labels) in loop:
                 data = data.to(self.device)
                 coeffs = coeffs.to(self.device)
                 labels = labels.to(self.device)
-                labels = labels.reshape(-1)
+
+                logits = self.model(data, coeffs)
+                preds = torch.argmax(logits, dim=1)
+
+                preds_list.append(preds.cpu())
                 labels_list.append(labels.cpu())
 
-                x, recon_time_series, system_derivative, recon_system_derivative, mask, zT = self.model(data, coeffs, 0)
+                loop.set_description(f"Test")
 
-                x = x.reshape(-1, self.window_size * self.input_channels)
-                recon_time_series = recon_time_series.reshape(-1, self.window_size * self.input_channels)
-                system_derivative = system_derivative.reshape(-1, self.window_size * self.input_channels)
-                recon_system_derivative = recon_system_derivative.reshape(-1, self.window_size * self.input_channels)
+        preds = torch.cat(preds_list, dim=0).numpy()
+        labels = torch.cat(labels_list, dim=0).numpy()
+        accuracy = accuracy_score(labels, preds)
+        macro_f1 = f1_score(labels, preds, average='macro')
 
-                loss_1 = torch.mean(self.loss_function(x, recon_time_series), dim=-1)
-                loss_2 = torch.mean(self.loss_function(system_derivative, recon_system_derivative), dim=-1)
-                time_recon_errors.append(loss_1.detach().cpu().numpy().reshape(-1))
-                system_recon_errors.append(loss_2.detach().cpu().numpy().reshape(-1))
+        return {
+            'accuracy': accuracy,
+            'macro_f1': macro_f1
+        }
 
-                loop.set_description(f"Validation")
-
-        time_recon_errors = np.concatenate(time_recon_errors, axis=0)
-        system_recon_errors = np.concatenate(system_recon_errors, axis=0)
-        labels = torch.cat(labels_list, dim=0)
-        labels = labels.reshape(-1).numpy()
-        final_VUS_PR = -np.inf
-        final_results = None
-        final_time_factor = None
-        final_system_factor = None
-        for time_factor in np.linspace(0.0, 1.0, num=11):
-            for system_factor in np.linspace(0.0, 1.0, num=11):
-                cur_scores = time_factor * time_recon_errors + system_factor * system_recon_errors
-                cur_scores = MinMaxScaler(feature_range=(0, 1)).fit_transform(cur_scores.reshape(-1, 1)).ravel()
-                evaluation_result = get_metrics(cur_scores, labels, slidingWindow=self.slidingWindow,
-                                                pred=cur_scores > (np.mean(cur_scores) + 3 * np.std(cur_scores)))
-                if evaluation_result['VUS-PR'] > final_VUS_PR:
-                    final_VUS_PR = evaluation_result['VUS-PR']
-                    final_results = evaluation_result
-                    final_time_factor = time_factor
-                    final_system_factor = system_factor
-
-        return final_results, final_time_factor, final_system_factor
-
-    def validation_model(self, iteration):
+    def validation_model(self):
         self.model.eval()
         loop = tqdm(enumerate(self.val_dataloader), total=len(self.val_dataloader), leave=True)
         avg_validation_loss = 0.0
         with torch.no_grad():
-            for index, (data, coeffs) in loop:
+            for index, (data, coeffs, labels) in loop:
                 data = data.to(self.device)
                 coeffs = coeffs.to(self.device)
+                labels = labels.to(self.device)
 
-                x, recon_time_series, system_derivative, recon_system_derivative, mask, zT = self.model(data, coeffs,
-                                                                                                        iteration)
-
-                loss_1 = self.loss_function(x, recon_time_series)
-                loss_1 = loss_1.mean(dim=-1) * mask
-                loss_2 = self.loss_function(system_derivative, recon_system_derivative) * self.lambda_derivative_recon
-                loss_2 = loss_2.mean(dim=-1) * mask
-                loss = torch.mean(loss_1 + loss_2)
+                logits = self.model(data, coeffs)
+                loss = self.loss_function(logits, labels)
 
                 avg_validation_loss += loss.item()
                 loop.set_description(f"Validation")
@@ -206,10 +168,13 @@ class Solver(nn.Module):
             print(Fore.BLUE + 'Datasets have been processed, load them directly....')
             train_data = torch.load(f'{self.save_path}/{self.dataset}/train_data_{str(self.missing_rate)}.pt')
             train_coeffs = torch.load(f'{self.save_path}/{self.dataset}/train_coeffs_{str(self.missing_rate)}.pt')
+            train_labels = torch.load(f'{self.save_path}/{self.dataset}/train_labels_{str(self.missing_rate)}.pt')
 
             validation_data = torch.load(f'{self.save_path}/{self.dataset}/validation_data_{str(self.missing_rate)}.pt')
             validation_coeffs = torch.load(
                 f'{self.save_path}/{self.dataset}/validation_coeffs_{str(self.missing_rate)}.pt')
+            validation_labels = torch.load(
+                f'{self.save_path}/{self.dataset}/validation_labels_{str(self.missing_rate)}.pt')
 
             test_data = torch.load(f'{self.save_path}/{self.dataset}/test_data_{str(self.missing_rate)}.pt')
             test_coeffs = torch.load(f'{self.save_path}/{self.dataset}/test_coeffs_{str(self.missing_rate)}.pt')
@@ -232,13 +197,19 @@ class Solver(nn.Module):
             self.slidingWindow = find_length_rank(data, rank=1)
             train_index = data_file.split('.')[0].split('_')[-3]
             data_train = data[:int(train_index), :]
+            labels_train = label[:int(train_index)]
 
             # Split data into training, validation, and test sets
-            train_data = data_train[:int((1 - self.validation_size) * len(data_train))]
-            validation_data = data_train[int((1 - self.validation_size) * len(data_train)):]
+            train_split = int((1 - self.validation_size) * len(data_train))
+            train_data = data_train[:train_split]
+            validation_data = data_train[train_split:]
+            train_labels = labels_train[:train_split]
+            validation_labels = labels_train[train_split:]
             if self.dataset == 'MSL' or self.dataset == 'TAO':
                 validation_data = np.vstack([validation_data, validation_data])
+                validation_labels = np.concatenate([validation_labels, validation_labels])
             test_data = data
+            test_labels = label
 
             # Normalize data
             train_data = self.normalize(train_data)
@@ -249,49 +220,62 @@ class Solver(nn.Module):
             train_data = torch.from_numpy(train_data).float()
             validation_data = torch.from_numpy(validation_data).float()
             test_data = torch.from_numpy(test_data).float()
-            test_labels = torch.from_numpy(label).long()
+            train_labels = torch.from_numpy(train_labels).long()
+            validation_labels = torch.from_numpy(validation_labels).long()
+            test_labels = torch.from_numpy(test_labels).long()
 
             self.input_channels = train_data.shape[1]
 
-            # Process the original data into batch-based and calculate doefficients in NCDE
-            train_data, train_coeffs = self.data_processor(data=train_data, data_type='train')
-            validation_data, validation_coeffs = self.data_processor(data=validation_data, data_type='validation')
-            test_data, test_coeffs = self.data_processor(data=test_data, data_type='test')
+            # Process the original data into batch-based and calculate coefficients in NCDE
+            train_data, train_coeffs, train_labels = self.data_processor(data=train_data, labels=train_labels,
+                                                                         data_type='train')
+            validation_data, validation_coeffs, validation_labels = self.data_processor(data=validation_data,
+                                                                                         labels=validation_labels,
+                                                                                         data_type='validation')
+            test_data, test_coeffs, test_labels = self.data_processor(data=test_data, labels=test_labels,
+                                                                      data_type='test')
 
             # Save them for reuse
             torch.save(train_data, f'{self.save_path}/{self.dataset}/train_data_{str(self.missing_rate)}.pt')
             torch.save(train_coeffs, f'{self.save_path}/{self.dataset}/train_coeffs_{str(self.missing_rate)}.pt')
+            torch.save(train_labels, f'{self.save_path}/{self.dataset}/train_labels_{str(self.missing_rate)}.pt')
 
             torch.save(validation_data, f'{self.save_path}/{self.dataset}/validation_data_{str(self.missing_rate)}.pt')
             torch.save(validation_coeffs,
                        f'{self.save_path}/{self.dataset}/validation_coeffs_{str(self.missing_rate)}.pt')
+            torch.save(validation_labels,
+                       f'{self.save_path}/{self.dataset}/validation_labels_{str(self.missing_rate)}.pt')
 
             torch.save(test_data, f'{self.save_path}/{self.dataset}/test_data_{str(self.missing_rate)}.pt')
             torch.save(test_coeffs, f'{self.save_path}/{self.dataset}/test_coeffs_{str(self.missing_rate)}.pt')
             torch.save(test_labels, f'{self.save_path}/{self.dataset}/test_labels_{str(self.missing_rate)}.pt')
 
-        # Define dataset and dataloder
-        train_dataset = TensorDataset(train_data, train_coeffs)
+        # Define dataset and dataloader
+        train_dataset = TensorDataset(train_data, train_coeffs, train_labels)
         self.train_dataloader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
-        validation_dataset = TensorDataset(validation_data, validation_coeffs)
+        validation_dataset = TensorDataset(validation_data, validation_coeffs, validation_labels)
         self.val_dataloader = DataLoader(validation_dataset, batch_size=self.batch_size, shuffle=False)
         test_dataset = TensorDataset(test_data, test_coeffs, test_labels)
         self.test_dataloader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
 
-    def data_processor(self, data, data_type):
+    def data_processor(self, data, labels, data_type):
         length = data.shape[0]
         step = 1
-        # sample_num = max(0, (len - self.window_size) // step + 1)
         processed_data = []
+        processed_labels = []
 
         # Process time series data
         for i in range(length):
             if i < data.shape[0] - self.window_size:
                 cur_data = data[i * step: i * step + self.window_size]
+                label_index = i * step + self.window_size - 1
             else:
                 cur_data = data[-self.window_size:]
+                label_index = data.shape[0] - 1
             processed_data.append(cur_data)
+            processed_labels.append(labels[label_index])
         processed_data = torch.stack(processed_data, dim=0)
+        processed_labels = torch.as_tensor(processed_labels).long()
 
         # Process missing data for training data if necessary
         if self.missing_rate > 0.05 and data_type == 'train':
@@ -304,7 +288,7 @@ class Solver(nn.Module):
         # Calculate the coefficients in NCDE
         ncde_coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(processed_data)
 
-        return processed_data, ncde_coeffs
+        return processed_data, ncde_coeffs, processed_labels
 
     def normalize(self, data):
         epsilon = 1e-8
