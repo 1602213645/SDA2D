@@ -17,7 +17,6 @@ from solver import Solver
 
 seeds = [2024, 2025, 2026, 2027, 2028]
 
-
 def set_seed(seed):
     # seeding
     print(Fore.RED + f'Current seed is set as {seed}')
@@ -77,8 +76,7 @@ if __name__ == '__main__':
     os.makedirs(results_save_path, exist_ok=True)
 
     df_records = pd.DataFrame(
-        columns=['AUC-PR', 'AUC-ROC', 'VUS-PR', 'VUS-ROC', 'Standard-F1', 'PA-F1', 'Event-based-F1', 'R-based-F1',
-                 'Affiliation-F', 'Seed'])
+        columns=['Accuracy', 'Macro-F1', 'Seed'])
 
     for seed in seeds:
         # Set seed
@@ -90,17 +88,10 @@ if __name__ == '__main__':
         solver.train_model()
 
         # Test model
-        evaluation_result, final_time_factor, final_system_factor = solver.test_model()
+        evaluation_result = solver.test_model()
         new_records = {
-            'AUC-PR': evaluation_result['AUC-PR'],
-            'AUC-ROC': evaluation_result['AUC-ROC'],
-            'VUS-PR': evaluation_result['VUS-PR'],
-            'VUS-ROC': evaluation_result['VUS-ROC'],
-            'Standard-F1': evaluation_result['Standard-F1'],
-            'PA-F1': evaluation_result['PA-F1'],
-            'Event-based-F1': evaluation_result['Event-based-F1'],
-            'R-based-F1': evaluation_result['R-based-F1'],
-            'Affiliation-F': evaluation_result['Affiliation-F'],
+            'Accuracy': evaluation_result['accuracy'],
+            'Macro-F1': evaluation_result['macro_f1'],
             'Seed': seed
         }
         with open(f"{results_save_path}/evaluation_results_{args.dataset}_{str(args.missing_rate)}_{str(seed)}.json", "w", encoding="utf-8") as file:
@@ -108,10 +99,6 @@ if __name__ == '__main__':
         file.close()
         df_records = pd.concat([df_records, pd.DataFrame([new_records])], ignore_index=True)
         print(evaluation_result)
-
-        with open(f'./results/{args.dataset}_factor_{str(args.missing_rate)}.txt', 'a') as file:
-            file.write(f'Seed: {seed}, Time Factor: {final_time_factor}, System Factor: {final_system_factor}\n')
-        file.close()
 
     # Save results
     df_records.to_csv(results_save_path + f'{args.dataset}_results_{str(args.missing_rate)}.csv', index=False)
